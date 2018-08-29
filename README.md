@@ -182,11 +182,11 @@ ARealSenseTestActor::ARealSenseTestActor()
 
 ## Known Issues
 
-* Frame drop/timeout on high resolutions (depends on hardware)
+* Frame drop/timeout on high resolutions might be laggy (depends on the hosts hardware)
 * High CPU usage (RealSenseSDK issue)
 * ColorizedDepth is CPU bound
-* PCL has texture corruptions
-* PCL update/rendering performance is low
+* PointCloud (PCL) has sometimes texture corruptions at thhe egdes (RealSenseSDK issue)
+* PointCloud (PCL) update/rendering performance is somtime slow
 
 ## License
 
