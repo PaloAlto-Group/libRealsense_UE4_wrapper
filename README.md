@@ -190,4 +190,4 @@ ARealSenseTestActor::ARealSenseTestActor()
 
 ## License
 
-This project is licensed under the Apache License, Version 2.0.
+This project is licensed under the [Apache License](https://github.com/PaloAlto-Group/libRealsense_UE4_wrapper/blob/master/LICENSE), Version 2.0.
