@@ -92,6 +92,14 @@ Point cloud support is experimental and has a lot of flaws. Current implementati
 
 _Picture: point cloud inspector_
 
+## Depth quality
+
+Allows to test the camera’s depth quality, including: Z-Accuracy, Sub-Pixel and Z RMS errors (spatial noise) and Fill Rate. [Same as this one.]( https://github.com/IntelRealSense/librealsense/tree/master/tools/depth-quality)
+
+![alt text](doc/img/depth_quality.jpg)
+
+_Picture: depth quality dropdown_
+
 ## Blueprint API
 
 `RealSenseContext` is global object initialized at plugin load. It wraps native RealSense library and provides device management functions.

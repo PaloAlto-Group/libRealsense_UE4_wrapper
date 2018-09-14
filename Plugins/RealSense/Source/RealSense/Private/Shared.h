@@ -4,10 +4,14 @@
 #include "Engine.h"
 
 #include <exception>
+#include <algorithm>
 #include <vector>
+#include <array>
 #include <map>
+#include <mutex>
 
 #include "RealSenseNative.h"
+#include "DynamicTexture.h"
 
 #pragma warning(disable: 4101) // unreferenced local variable
 

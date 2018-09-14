@@ -172,3 +172,36 @@ struct FRealSenseOptionRange
 	UPROPERTY(Category="RealSense", BlueprintReadOnly, VisibleAnywhere)
 	float Default;
 };
+
+USTRUCT(BlueprintType)
+struct FRealSenseDepthQuality
+{
+	GENERATED_BODY()
+
+	UPROPERTY(Category = "RealSense", BlueprintReadOnly, VisibleAnywhere)
+	bool bPlaneFit;
+
+	UPROPERTY(Category = "RealSense", BlueprintReadOnly, VisibleAnywhere)
+	float Distance;
+
+	UPROPERTY(Category = "RealSense", BlueprintReadOnly, VisibleAnywhere)
+	float Angle;
+
+	UPROPERTY(Category = "RealSense", BlueprintReadOnly, VisibleAnywhere)
+	float FillRate;
+
+	UPROPERTY(Category = "RealSense", BlueprintReadOnly, VisibleAnywhere)
+	float PlaneFitError;
+
+	UPROPERTY(Category = "RealSense", BlueprintReadOnly, VisibleAnywhere)
+	float SubpixelError;
+
+	UPROPERTY(Category = "RealSense", BlueprintReadOnly, VisibleAnywhere)
+	float ZAccuracy;
+
+	UPROPERTY(Category = "RealSense", BlueprintReadOnly, VisibleAnywhere)
+	FVector2D RoiMin;
+
+	UPROPERTY(Category = "RealSense", BlueprintReadOnly, VisibleAnywhere)
+	FVector2D RoiMax;
+};

@@ -79,6 +79,9 @@ public:
 	UPROPERTY(Category="DepthStream", BlueprintReadOnly)
 	float DepthScale = 0.001f;
 
+	UPROPERTY(Category = "DepthStream", BlueprintReadOnly)
+	float StereoBaseline = -1.0f;
+
 	UPROPERTY(Category="DepthStream", BlueprintReadOnly)
 	UTexture2D* DepthRawTexture;
 
@@ -133,6 +136,20 @@ public:
 	UPROPERTY(Category = "PointCloud", BlueprintReadOnly)
 	class UMaterialInterface* PclMaterial;
 
+	// DepthQuality
+
+	UPROPERTY(Category = "DepthQuality", BlueprintReadWrite, EditAnywhere)
+	bool bAnalyzeDepthQuality = false;
+
+	UPROPERTY(Category = "DepthQuality", BlueprintReadWrite, EditAnywhere, meta = (ClampMin = "0.1", ClampMax = "1", UIMin = "0.1", UIMax = "1"))
+	float AnalyzeROI = 0.4f;
+
+	UPROPERTY(Category = "DepthQuality", BlueprintReadWrite, EditAnywhere, meta = (ClampMin = "0", ClampMax = "2000", UIMin = "0", UIMax = "2000"))
+	int32 AnalyzeGroundTruth = 0;
+
+	UPROPERTY(Category = "DepthQuality", BlueprintReadOnly, VisibleAnywhere)
+	FRealSenseDepthQuality DepthQuality;
+
 protected:
 
 	// AActor
@@ -144,7 +161,13 @@ private:
 	void PollFrames();
 	void WaitFrames();
 	void ProcessFrameset(class rs2::frameset* Frameset);
+
+	void AnalyzeDepthQuality(class rs2::depth_frame* Frame);
+	void ResetDepthQuality();
+
 	void UpdatePointCloud();
+
+	void GetDeviceInfo(class rs2::device* Device);
 	void EnsureProfileSupported(class URealSenseDevice* Device, ERealSenseStreamType StreamType, ERealSenseFormatType Format, FRealSenseStreamMode Mode);
 
 	FCriticalSection StateMx;
@@ -164,7 +187,6 @@ private:
 		TArray<FPointCloudVertex> PclVertices;
 		TArray<int32> PclIndices;
 	};
-
 	TUniquePtr<class rs2::pointcloud> RsPointCloud;
 	TUniquePtr<class rs2::points> RsPoints;
 	TMap< int32, TUniquePtr<FMeshSection> > PclMeshData;

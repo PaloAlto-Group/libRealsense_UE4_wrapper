@@ -5,6 +5,7 @@
 #pragma warning(disable: 4458)
 #pragma warning(disable: 4577)
 #include <librealsense2/rs.hpp>
+#include <librealsense2/rsutil.h>
 #pragma warning(pop)
 
 namespace rs2 {

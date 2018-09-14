@@ -30,16 +30,20 @@ FDynamicTexture::~FDynamicTexture()
 	REALSENSE_TRACE(TEXT("~FDynamicTexture %p %s CommandCounter=%d TudPool=%d"), this, *Name, (int)CommandCounter.GetValue(), (int)TudPool.size());
 
 	{
+		NAMED_PROFILER("WaitCommandCounter");
 		const float Timeout = 5;
 		const float Granularity = 200.0f / 1000.0f;
 		int NumTries = (int)(Timeout / Granularity);
 
-		NAMED_PROFILER("WaitCommandCounter");
 		while (CommandCounter.GetValue() > 0 && NumTries > 0)
 		{
-			//REALSENSE_ERR(TEXT("Wait FDynamicTexture CommandCounter=%d"), (int)CommandCounter.GetValue());
 			FPlatformProcess::Sleep(Granularity);
 			NumTries--;
+		}
+
+		if (CommandCounter.GetValue())
+		{
+			REALSENSE_ERR(TEXT("~FDynamicTexture %p %s CommandCounter=%d"), this, *Name, (int)CommandCounter.GetValue());
 		}
 	}
 
@@ -49,52 +53,39 @@ FDynamicTexture::~FDynamicTexture()
 		TextureObject = nullptr;
 	}
 
-	for (FTextureUpdateData* Tud : TudPool)
-	{
-		if (Tud->Data) FMemory::Free(Tud->Data);
-		FMemory::Free(Tud);
-	}
-	TudPool.clear();
-}
+	DeallocBuffer(EnqueTud);
 
-FTextureUpdateData* FDynamicTexture::AllocBuffer()
-{
-	SCOPED_PROFILER;
-
-	if (!TudPool.empty())
 	{
 		FScopeLock Lock(&TudMx);
-		if (!TudPool.empty())
+		for (FTextureUpdateData* Tud : TudPool)
 		{
-			auto Tud = TudPool.back();
-			TudPool.pop_back();
-			return Tud;
+			if (Tud->Data) FMemory::Free(Tud->Data);
+			FMemory::Free(Tud);
+			BufferCounter.Decrement();
 		}
+		TudPool.clear();
 	}
 
-	auto Tud = (FTextureUpdateData*)FMemory::Malloc(sizeof(FTextureUpdateData), PLATFORM_CACHE_LINE_SIZE);
-	Tud->Context = this;
-	Tud->DataSize = Width * Height * Bpp;
-	Tud->Data = FMemory::Malloc(Tud->DataSize, PLATFORM_CACHE_LINE_SIZE);
-	Tud->Stride = Width * Bpp;
-	Tud->Width = Width;
-	Tud->Height = Height;
-
-	return Tud;
+	if (BufferCounter.GetValue())
+	{
+		REALSENSE_ERR(TEXT("~FDynamicTexture %p %s BufferCounter=%d"), this, *Name, (int)BufferCounter.GetValue());
+	}
 }
 
-void FDynamicTexture::EnqueUpdateCommand(FTextureUpdateData* Tud)
+void FDynamicTexture::Tick_GameThread()
 {
 	SCOPED_PROFILER;
 
-	// UE4 is so great!
-	const bool HackIsValidThread = (!GIsThreadedRendering || ENamedThreads::GetRenderThread() != ENamedThreads::GameThread);
-
-	if (!HackIsValidThread)
+	FTextureUpdateData* Tud = nullptr;
+	if (EnqueTud)
 	{
-		REALSENSE_ERR(TEXT("EnqueUpdateCommand: invalid thread"));
+		FScopeLock Lock(&EnqueMx);
+		Tud = EnqueTud;
+		EnqueTud = nullptr;
 	}
-	else if (TextureObject && TextureObject->Resource)
+
+	// render commands should be submitted only from game thread because UE4 is braindamaged :D
+	if (Tud)
 	{
 		CommandCounter.Increment();
 		ENQUEUE_UNIQUE_RENDER_COMMAND_ONEPARAMETER(
@@ -106,7 +97,24 @@ void FDynamicTexture::EnqueUpdateCommand(FTextureUpdateData* Tud)
 	}
 }
 
-void FDynamicTexture::Update(const rs2::video_frame& Frame)
+//
+// UPDATE
+//
+
+void FDynamicTexture::EnqueUpdateData(FTextureUpdateData* Tud)
+{
+	SCOPED_PROFILER;
+
+	FTextureUpdateData* Old = nullptr;
+	{
+		FScopeLock Lock(&EnqueMx);
+		Old = EnqueTud;
+		EnqueTud = Tud;
+	}
+	DeallocBuffer(Old);
+}
+
+void FDynamicTexture::EnqueUpdateFrame(const rs2::video_frame& Frame)
 {
 	SCOPED_PROFILER;
 
@@ -116,14 +124,14 @@ void FDynamicTexture::Update(const rs2::video_frame& Frame)
 
 	if (Width != fw || Height != fh || Bpp != fbpp)
 	{
-		REALSENSE_ERR(TEXT("Invalid video_frame: %s Width=%d Height=%d Bpp=%d"), 
+		REALSENSE_ERR(TEXT("Invalid video_frame: %s Width=%d Height=%d Bpp=%d"),
 			*Name, fw, fh, fbpp);
 		return;
 	}
 
 	auto* Tud = AllocBuffer();
 	CopyData(Tud, Frame);
-	EnqueUpdateCommand(Tud);
+	EnqueUpdateData(Tud);
 }
 
 void FDynamicTexture::CopyData(FTextureUpdateData* Tud, const rs2::video_frame& Frame)
@@ -146,11 +154,55 @@ void FDynamicTexture::CopyData(FTextureUpdateData* Tud, const rs2::video_frame& 
 	}
 }
 
+//
+// TUD POOL
+//
+
+FTextureUpdateData* FDynamicTexture::AllocBuffer()
+{
+	SCOPED_PROFILER;
+
+	if (!TudPool.empty())
+	{
+		FScopeLock Lock(&TudMx);
+		if (!TudPool.empty())
+		{
+			auto Tud = TudPool.back();
+			TudPool.pop_back();
+			return Tud;
+		}
+	}
+
+	auto Tud = (FTextureUpdateData*)FMemory::Malloc(sizeof(FTextureUpdateData), PLATFORM_CACHE_LINE_SIZE);
+	BufferCounter.Increment();
+	Tud->Context = this;
+	Tud->DataSize = Width * Height * Bpp;
+	Tud->Data = FMemory::Malloc(Tud->DataSize, PLATFORM_CACHE_LINE_SIZE);
+	Tud->Stride = Width * Bpp;
+	Tud->Width = Width;
+	Tud->Height = Height;
+
+	return Tud;
+}
+
+void FDynamicTexture::DeallocBuffer(FTextureUpdateData* Tud)
+{
+	if (Tud)
+	{
+		FScopeLock Lock(&TudMx);
+		TudPool.push_back(Tud);
+	}
+}
+
+//
+// RENDER COMMANDS
+//
+
 void FDynamicTexture::RenderCmd_CreateTexture()
 {
 	SCOPED_PROFILER;
 
-	REALSENSE_TRACE(TEXT("FDynamicTexture::RenderCmd_CreateTexture %p %s"), this, *Name);
+	REALSENSE_TRACE(TEXT("RenderCmd_CreateTexture %p %s"), this, *Name);
 
 	auto Tex = UTexture2D::CreateTransient(Width, Height, Format);
 	if (!Tex)
@@ -160,7 +212,7 @@ void FDynamicTexture::RenderCmd_CreateTexture()
 	else
 	{
 		#if WITH_EDITORONLY_DATA
-			Tex->MipGenSettings = TextureMipGenSettings::TMGS_NoMipmaps;
+		Tex->MipGenSettings = TextureMipGenSettings::TMGS_NoMipmaps;
 		#endif
 
 		Tex->CompressionSettings = Compression;
@@ -184,18 +236,15 @@ void FDynamicTexture::RenderCmd_UpdateTexture(FTextureUpdateData* Tud)
 	if (Tex && Tex->Resource)
 	{
 		RHIUpdateTexture2D(
-			((FTexture2DResource*)Tex->Resource)->GetTexture2DRHI(), 
-			0, 
-			FUpdateTextureRegion2D(0, 0, 0, 0, Tud->Width, Tud->Height), 
-			Tud->Stride, 
+			((FTexture2DResource*)Tex->Resource)->GetTexture2DRHI(),
+			0,
+			FUpdateTextureRegion2D(0, 0, 0, 0, Tud->Width, Tud->Height),
+			Tud->Stride,
 			(const uint8*)Tud->Data
 		);
 	}
 
-	{
-		FScopeLock Lock(&TudMx);
-		TudPool.push_back(Tud);
-	}
+	DeallocBuffer(Tud);
 
 	CommandCounter.Decrement();
 }

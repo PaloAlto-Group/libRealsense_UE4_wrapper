@@ -1,18 +1,15 @@
 #include "PCH.h"
+#include <numeric>
+#include "rs2_utils.h"
+#include "rs2_colorizer.h"
+#include "rs2_depth_metrics.h"
 
 #define MAX_BUFFER_U16 0xFFFF
 
 template<typename T>
 inline UTexture2D* Get(TUniquePtr<T>& Dtex) { return Dtex.Get() ? Dtex.Get()->GetTextureObject() : nullptr; }
 
-inline float GetDepthScale(rs2::device dev) {
-	for (auto& sensor : dev.query_sensors()) {
-		if (auto depth = sensor.as<rs2::depth_sensor>()) {
-			return depth.get_depth_scale();
-		}
-	}
-	throw rs2::error("Depth not supported");
-}
+inline void TickTex(FDynamicTexture* Tex) { if (Tex) Tex->Tick_GameThread(); }
 
 ARealSenseInspector::ARealSenseInspector(const FObjectInitializer& ObjectInitializer) : Super(ObjectInitializer)
 {
@@ -90,7 +87,8 @@ bool ARealSenseInspector::Start()
 			RsConfig.enable_device(std::string(TCHAR_TO_ANSI(*ActiveDevice->Serial)));
 		}
 
-		if (bEnableRawDepth || bEnableColorizedDepth || bEnablePcl)
+		const bool EnableDepthStream = bEnableRawDepth || bEnableColorizedDepth || bEnablePcl;
+		if (EnableDepthStream)
 		{
 			if (!IsPlaybackMode)
 			{
@@ -137,6 +135,11 @@ bool ARealSenseInspector::Start()
 
 		if (bEnableInfrared)
 		{
+			if (EnableDepthStream)
+			{
+				InfraredConfig = DepthConfig;
+			}
+
 			if (!IsPlaybackMode)
 			{
 				REALSENSE_TRACE(TEXT("enable_stream INFRARED %dx%d @%d"), InfraredConfig.Width, InfraredConfig.Height, InfraredConfig.Rate);
@@ -171,8 +174,8 @@ bool ARealSenseInspector::Start()
 		REALSENSE_TRACE(TEXT("Start pipeline"));
 		RsPipeline.Reset(new rs2::pipeline());
 		rs2::pipeline_profile RsProfile = RsPipeline->start(RsConfig);
-		DepthScale = GetDepthScale(RsProfile.get_device());
-		REALSENSE_TRACE(TEXT("DepthScale=%f"), DepthScale);
+		auto Device = RsProfile.get_device();
+		GetDeviceInfo(&Device);
 		StartedFlag = true;
 
 		REALSENSE_TRACE(TEXT("Start worker"));
@@ -229,7 +232,7 @@ void ARealSenseInspector::Stop()
 
 		if (Thread.Get())
 		{
-			REALSENSE_TRACE(TEXT("Join thread"));
+			REALSENSE_TRACE(TEXT("JoinRealSenseThread"));
 			{
 				NAMED_PROFILER("JoinRealSenseThread");
 				Thread->WaitForCompletion();
@@ -245,20 +248,13 @@ void ARealSenseInspector::Stop()
 		RsPoints.Reset();
 		RsPointCloud.Reset();
 
-		REALSENSE_TRACE(TEXT("Flush rendering commands"));
+		REALSENSE_TRACE(TEXT("FlushRenderingCommands"));
 		{
 			NAMED_PROFILER("FlushRenderingCommands");
-
-			ENQUEUE_UNIQUE_RENDER_COMMAND(FlushCommand,
-			{
-				GRHICommandList.GetImmediateCommandList().ImmediateFlush(EImmediateFlushType::FlushRHIThreadFlushResources);
-				RHIFlushResources();
-				GRHICommandList.GetImmediateCommandList().ImmediateFlush(EImmediateFlushType::FlushRHIThreadFlushResources);
-			});
 			FlushRenderingCommands();
 		}
 
-		REALSENSE_TRACE(TEXT("Destroy dynamic textures"));
+		REALSENSE_TRACE(TEXT("DestroyDynamicTextures"));
 		{
 			NAMED_PROFILER("DestroyDynamicTextures");
 			DepthRawDtex.Reset();
@@ -370,6 +366,11 @@ void ARealSenseInspector::ProcessFrameset(rs2::frameset* Frameset)
 
 	FScopedTryLock PclScopedMx;
 
+	if (!(bEnableRawDepth && bAnalyzeDepthQuality))
+	{
+		ResetDepthQuality();
+	}
+
 	if (bEnableRawDepth || bEnableColorizedDepth || bEnablePcl)
 	{
 		rs2::depth_frame DepthFrame = (bAlignDepthToColor && RsAlign.Get()) ? RsAlign->process(*Frameset).get_depth_frame() : Frameset->get_depth_frame();
@@ -377,15 +378,20 @@ void ARealSenseInspector::ProcessFrameset(rs2::frameset* Frameset)
 		if (bEnableRawDepth && DepthRawDtex.Get())
 		{
 			NAMED_PROFILER("UpdateDepthRaw");
-			DepthRawDtex->Update(DepthFrame);
+			DepthRawDtex->EnqueUpdateFrame(DepthFrame);
+		}
+
+		if (bEnableRawDepth && bAnalyzeDepthQuality)
+		{
+			AnalyzeDepthQuality(&DepthFrame);
 		}
 
 		if (bEnableColorizedDepth && DepthColorizedDtex.Get())
 		{
 			NAMED_PROFILER("UpdateDepthColorized");
 			auto* Tud = DepthColorizedDtex->AllocBuffer();
-			rs2_utils::colorize_depth((rs2_utils::depth_pixel*)Tud->Data, DepthFrame, (int)DepthColormap, DepthMin, DepthMax, DepthScale, bEqualizeHistogram);
-			DepthColorizedDtex->EnqueUpdateCommand(Tud);
+			rs2::colorize_depth((rs2::pixel_rgba8*)Tud->Data, DepthFrame, (int)DepthColormap, DepthMin, DepthMax, DepthScale, bEqualizeHistogram);
+			DepthColorizedDtex->EnqueUpdateData(Tud);
 		}
 
 		if (bEnablePcl && RsPointCloud.Get() && PclCalculateFlag)
@@ -405,7 +411,7 @@ void ARealSenseInspector::ProcessFrameset(rs2::frameset* Frameset)
 		if (ColorDtex.Get())
 		{
 			NAMED_PROFILER("UpdateColor");
-			ColorDtex->Update(ColorFrame);
+			ColorDtex->EnqueUpdateFrame(ColorFrame);
 		}
 
 		if (PclScopedMx.IsLocked())
@@ -426,7 +432,7 @@ void ARealSenseInspector::ProcessFrameset(rs2::frameset* Frameset)
 	if (bEnableInfrared && InfraredDtex.Get())
 	{
 		NAMED_PROFILER("UpdateInfrared");
-		InfraredDtex->Update(Frameset->get_infrared_frame());
+		InfraredDtex->EnqueUpdateFrame(Frameset->get_infrared_frame());
 	}
 
 	//REALSENSE_TRACE(TEXT("Frameset %d"), FramesetId);
@@ -438,6 +444,14 @@ void ARealSenseInspector::Tick(float DeltaSeconds)
 	SCOPED_PROFILER;
 
 	Super::Tick(DeltaSeconds);
+
+	{
+		NAMED_PROFILER("TickTextures");
+		TickTex(DepthRawDtex.Get());
+		TickTex(DepthColorizedDtex.Get());
+		TickTex(ColorDtex.Get());
+		TickTex(InfraredDtex.Get());
+	}
 
 	if (bEnablePcl && PclMesh && StartedFlag)
 	{
@@ -462,6 +476,160 @@ void ARealSenseInspector::Tick(float DeltaSeconds)
 	{
 		PclMesh->SetVisibility(false);
 	}
+}
+
+void ARealSenseInspector::AnalyzeDepthQuality(rs2::depth_frame* Frame)
+{
+	SCOPED_PROFILER;
+
+	auto profile = Frame->get_profile();
+	auto stream_type = profile.stream_type();
+
+	auto depth_profile = profile.as<rs2::video_stream_profile>();
+	rs2_intrinsics intrin = depth_profile.get_intrinsics();
+	rs2::region_of_interest roi = { 
+		int(intrin.width * (0.5f - 0.5f * AnalyzeROI)),
+		int(intrin.height * (0.5f - 0.5f * AnalyzeROI)),
+		int(intrin.width * (0.5f + 0.5f * AnalyzeROI)),
+		int(intrin.height * (0.5f + 0.5f * AnalyzeROI))
+	};
+
+	std::vector<rs2::depth_quality::single_metric_data> sample;
+
+	auto metrics = rs2::depth_quality::analyze_depth_image(
+		*Frame, DepthScale, StereoBaseline, &intrin, roi, AnalyzeGroundTruth, DepthQuality.bPlaneFit, sample, false,
+		[&](
+			const std::vector<rs2::float3>& points,
+			const rs2::plane p,
+			const rs2::region_of_interest roi,
+			const float baseline_mm,
+			const float focal_length_pixels,
+			const int ground_truth_mm,
+			const bool plane_fit,
+			const float plane_fit_to_ground_truth_mm,
+			const float distance_mm,
+			bool record,
+			std::vector<rs2::depth_quality::single_metric_data>& samples)
+		{
+			float TO_METERS = DepthScale;
+			static const float TO_MM = 1000.f;
+			static const float TO_PERCENT = 100.f;
+
+			// Calculate fill rate relative to the ROI
+			auto fill_rate = points.size() / float((roi.max_x - roi.min_x)*(roi.max_y - roi.min_y)) * TO_PERCENT;
+			//fill->add_value(fill_rate);
+			//if (record) samples.push_back({ fill->get_name(),  fill_rate });
+			DepthQuality.FillRate = fill_rate;
+
+			if (!plane_fit)
+			{
+				DepthQuality.PlaneFitError = -1;
+				DepthQuality.SubpixelError = -1;
+				DepthQuality.ZAccuracy = -1;
+				return;
+			}
+
+			const float bf_factor = baseline_mm * focal_length_pixels * TO_METERS; // also convert point units from mm to meter
+
+			std::vector<rs2::float3> points_set = points;
+			std::vector<float> distances;
+			std::vector<float> disparities;
+			std::vector<float> gt_errors;
+
+			// Reserve memory for the data
+			distances.reserve(points.size());
+			disparities.reserve(points.size());
+			if (ground_truth_mm) gt_errors.reserve(points.size());
+
+			// Remove outliers [below 0.5% and above 99.5%)
+			std::sort(points_set.begin(), points_set.end(), [](const rs2::float3& a, const rs2::float3& b) { return a.z < b.z; });
+			size_t outliers = points_set.size() / 200;
+			points_set.erase(points_set.begin(), points_set.begin() + outliers); // crop min 0.5% of the dataset
+			points_set.resize(points_set.size() - outliers); // crop max 0.5% of the dataset
+
+															 // Convert Z values into Depth values by aligning the Fitted plane with the Ground Truth (GT) plane
+															 // Calculate distance and disparity of Z values to the fitted plane.
+															 // Use the rotated plane fit to calculate GT errors
+			for (auto point : points_set)
+			{
+				// Find distance from point to the reconstructed plane
+				auto dist2plane = p.a*point.x + p.b*point.y + p.c*point.z + p.d;
+				// Project the point to plane in 3D and find distance to the intersection point
+				rs2::float3 plane_intersect = { 
+					float(point.x - dist2plane*p.a),
+					float(point.y - dist2plane*p.b),
+					float(point.z - dist2plane*p.c) };
+
+				// Store distance, disparity and gt- error
+				distances.push_back(dist2plane * TO_MM);
+				disparities.push_back(bf_factor / point.length() - bf_factor / plane_intersect.length());
+				// The negative dist2plane represents a point closer to the camera than the fitted plane
+				if (ground_truth_mm) gt_errors.push_back(plane_fit_to_ground_truth_mm + (dist2plane * TO_MM));
+			}
+
+			// Show Z accuracy metric only when Ground Truth is available
+			//z_accuracy->enable(ground_truth_mm > 0);
+			if (ground_truth_mm > 0)
+			{
+				std::sort(begin(gt_errors), end(gt_errors));
+				auto gt_median = gt_errors[gt_errors.size() / 2];
+				auto accuracy = TO_PERCENT * (gt_median / ground_truth_mm);
+				//z_accuracy->add_value(accuracy);
+				//if (record) samples.push_back({ z_accuracy->get_name(),  accuracy });
+				DepthQuality.ZAccuracy = accuracy;
+			}
+			else
+			{
+				DepthQuality.ZAccuracy = -1;
+			}
+
+			// Calculate Sub-pixel RMS for Stereo-based Depth sensors
+			double total_sq_disparity_diff = 0;
+			for (auto disparity : disparities)
+			{
+				total_sq_disparity_diff += disparity*disparity;
+			}
+			auto rms_subpixel_val = static_cast<float>(std::sqrt(total_sq_disparity_diff / disparities.size()));
+			//sub_pixel_rms_error->add_value(rms_subpixel_val);
+			//if (record) samples.push_back({ sub_pixel_rms_error->get_name(),  rms_subpixel_val });
+
+			// Calculate Plane Fit RMS  (Spatial Noise) mm
+			double plane_fit_err_sqr_sum = std::inner_product(distances.begin(), distances.end(), distances.begin(), 0.);
+			auto rms_error_val = static_cast<float>(std::sqrt(plane_fit_err_sqr_sum / distances.size()));
+			auto rms_error_val_per = TO_PERCENT * (rms_error_val / distance_mm);
+			//plane_fit_rms_error->add_value(rms_error_val_per);
+			//if (record) samples.push_back({ plane_fit_rms_error->get_name(),  rms_error_val });
+
+			DepthQuality.PlaneFitError = rms_error_val_per;
+			DepthQuality.SubpixelError = rms_subpixel_val;
+		}
+	);
+
+	DepthQuality.bPlaneFit = rs2::is_valid(metrics.plane_corners);
+	DepthQuality.Distance = metrics.distance;
+	DepthQuality.Angle = metrics.angle;
+
+	if (DepthQuality.bPlaneFit)
+	{
+		const float sx = 1.0f / (float)depth_profile.width();
+		const float sy = 1.0f / (float)depth_profile.height();
+
+		DepthQuality.RoiMin = FVector2D(metrics.roi.min_x * sx, metrics.roi.min_y * sy);
+		DepthQuality.RoiMax = FVector2D(metrics.roi.max_x * sx, metrics.roi.max_y * sy);
+	}
+}
+
+void ARealSenseInspector::ResetDepthQuality()
+{
+	DepthQuality.bPlaneFit = false;
+	DepthQuality.Distance = -1;
+	DepthQuality.Angle = -1;
+	DepthQuality.FillRate = -1;
+	DepthQuality.PlaneFitError = -1;
+	DepthQuality.SubpixelError = -1;
+	DepthQuality.ZAccuracy = -1;
+	DepthQuality.RoiMin = FVector2D(0, 0);
+	DepthQuality.RoiMax = FVector2D(0, 0);
 }
 
 void ARealSenseInspector::UpdatePointCloud()
@@ -622,6 +790,31 @@ void ARealSenseInspector::SetPointCloudMaterial(int SectionId, UMaterialInterfac
 			PclMesh->SetMaterial(i, Material);
 		}
 	}
+}
+
+void ARealSenseInspector::GetDeviceInfo(rs2::device* Device)
+{
+	auto dpt_sensor = std::make_shared<rs2::depth_sensor>(Device->first<rs2::depth_sensor>());
+
+	DepthScale = dpt_sensor->get_depth_scale();
+	REALSENSE_TRACE(TEXT("DepthScale=%f"), DepthScale);
+
+	auto baseline_mm = -1.f;
+	auto profiles = dpt_sensor->get_stream_profiles();
+	auto right_sensor = std::find_if(profiles.begin(), profiles.end(), [](rs2::stream_profile& p)
+	{ return (p.stream_index() == 2) && (p.stream_type() == RS2_STREAM_INFRARED); });
+
+	if (right_sensor != profiles.end())
+	{
+		auto left_sensor = std::find_if(profiles.begin(), profiles.end(), [](rs2::stream_profile& p)
+		{ return (p.stream_index() == 0) && (p.stream_type() == RS2_STREAM_DEPTH); });
+
+		auto extrin = (*left_sensor).get_extrinsics_to(*right_sensor);
+		baseline_mm = fabs(extrin.translation[0]) * 1000;  // baseline in mm
+	}
+
+	StereoBaseline = baseline_mm;
+	REALSENSE_TRACE(TEXT("StereoBaseline=%f"), StereoBaseline);
 }
 
 void ARealSenseInspector::EnsureProfileSupported(URealSenseDevice* Device, ERealSenseStreamType StreamType, ERealSenseFormatType Format, FRealSenseStreamMode Mode)
